@@ -780,7 +780,15 @@ func (s *PostgresStore) FindMatchingGrants(ctx context.Context, req domain.Autho
 			  )
 			  AND (
 			      ra.resource_id IS NULL
-			      OR (ra.resource_type = $3 AND ra.resource_id = NULLIF($6, ''))
+			      OR (
+			          ra.resource_id = NULLIF($6, '')
+			          AND (
+			              ra.resource_type IS NULL
+			              OR ra.resource_type = '*'
+			              OR ra.resource_type = 'distribution_system'
+			              OR ra.resource_type = $3
+			          )
+			      )
 			  )
 		),
 		effective_roles AS (

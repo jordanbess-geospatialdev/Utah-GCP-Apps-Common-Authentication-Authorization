@@ -433,7 +433,13 @@ func (m *MemoryStore) FindMatchingGrants(_ context.Context, req domain.Authorize
 			continue
 		}
 		if ra.ResourceID != nil {
-			if ra.ResourceType == nil || *ra.ResourceType != req.ResourceType || *ra.ResourceID != req.ResourceID {
+			if *ra.ResourceID != req.ResourceID {
+				continue
+			}
+			if ra.ResourceType != nil &&
+				*ra.ResourceType != "*" &&
+				*ra.ResourceType != "distribution_system" &&
+				*ra.ResourceType != req.ResourceType {
 				continue
 			}
 		}

@@ -262,8 +262,7 @@ CREATE TABLE role_assignments (
         (principal_type = 'group' AND group_id IS NOT NULL AND user_id IS NULL)
     ),
     CONSTRAINT chk_resource_pair CHECK (
-        (resource_type IS NULL AND resource_id IS NULL) OR
-        (resource_type IS NOT NULL AND resource_id IS NOT NULL)
+        resource_type IS NULL OR resource_id IS NOT NULL
     )
 );
 
