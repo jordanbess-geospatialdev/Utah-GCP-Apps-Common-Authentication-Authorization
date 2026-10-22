@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: utah-authz-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: utah_authz
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations/000001_init_schema.up.sql:/docker-entrypoint-initdb.d/01_init_schema.sql:ro
+      - ./migrations/000002_seed_utah_defaults.up.sql:/docker-entrypoint-initdb.d/02_seed_utah_defaults.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d utah_authz"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  authz-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: utah-authz-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: "8080"
+      ENVIRONMENT: "development"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/utah_authz?sslmode=disable"
+      AUTHZ_ISSUER_URL: "http://localhost:8080"
+      AUTHZ_SIGNING_KEY_ID: "local-dev-es256-key-1"
+      ADMIN_BOOTSTRAP_API_KEY: "dev-utah-bootstrap-secret"
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
