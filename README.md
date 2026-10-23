@@ -12,6 +12,8 @@ Designed for State of Utah applications (such as Utah Division of Water Resource
 
 ## Documentation Guides
 
+- 🎨 **[Visual Architecture & Infographic Guide (`docs/VISUAL_ARCHITECTURE_GUIDE.md`)](./docs/VISUAL_ARCHITECTURE_GUIDE.md)** — High-resolution architecture infographics illustrating the Legacy vs. Zero Trust transformation, Two-Stage GCP Cloud Architecture, Hybrid RBAC + `ltree` + ABAC Decision Engine, and the 6 Utah Water Personas.
+- 📊 **[Executive Slide Deck for Non-Technical Managers (`docs/EXECUTIVE_SLIDE_DECK.md`)](./docs/EXECUTIVE_SLIDE_DECK.md)** — Plain-English presentation explaining the business case, Zero Trust security principles, the 6 Utah Water Personas, and technology choices for leadership.
 - 📘 **[Developer Guide (`docs/DEVELOPER_GUIDE.md`)](./docs/DEVELOPER_GUIDE.md)** — Architecture deep-dive, local development setup, PostgreSQL schema & scoping reference, complete REST API reference, and downstream SDK integration examples.
 - 🏛️ **[DWRi Personas, Figma Mockups & Legacy Migration Guide (`docs/DWRI_PERSONAS_AND_LEGACY_MIGRATION.md`)](./docs/DWRI_PERSONAS_AND_LEGACY_MIGRATION.md)** — Complete mapping of the 6 Personas (Donna, Wiley/Parker, Sarah, Cody/Deputies, Fatima's 4 Engineer profiles, and Diego) from the 72-page 2026 UCD PDF, Figma prototypes, and the 4 legacy permission stores (`wrsysDB`, `DVRTEDIT`, `Water Use Program`, `HydroServer`).
 - 🚀 **[GCP Deployment Guide (`docs/DEPLOYMENT_GUIDE.md`)](./docs/DEPLOYMENT_GUIDE.md)** — Step-by-step instructions for provisioning Cloud SQL for PostgreSQL 16, GCP Secret Manager keys, least-privilege IAM service accounts, Cloud Run deployment, and production UtahID configuration.
