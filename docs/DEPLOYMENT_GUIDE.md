@@ -13,7 +13,8 @@ This guide provides step-by-step instructions to deploy the **Utah Common Authen
 6. [Step 5: Configure Least-Privilege IAM Service Account](#6-step-5-configure-least-privilege-iam-service-account)
 7. [Step 6: Build & Deploy to GCP Cloud Run](#7-step-6-build--deploy-to-gcp-cloud-run)
 8. [Step 7: Configure UtahID OIDC & External Identity Providers](#8-step-7-configure-utahid-oidc--external-identity-providers)
-9. [Production Hardening & Operations Checklist](#9-production-hardening--operations-checklist)
+9. [Step 8 (Optional): Google Identity-Aware Proxy (IAP)](#9-step-8-optional-google-identity-aware-proxy-iap)
+10. [Production Hardening & Operations Checklist](#10-production-hardening--operations-checklist)
 
 ---
 
@@ -106,14 +107,13 @@ Connect via the **Cloud SQL Auth Proxy** to apply the initial schema (`pgcrypto`
 cloud-sql-proxy "${PROJECT_ID}:${REGION}:${SQL_INSTANCE}" --port 5433 &
 PROXY_PID=$!
 
-# 2. Apply schema and seed migrations
-PGPASSWORD="${DB_PASS}" psql \
-  -h 127.0.0.1 -p 5433 -U "${DB_USER}" -d "${DB_NAME}" \
-  -f migrations/000001_init_schema.up.sql
-
-PGPASSWORD="${DB_PASS}" psql \
-  -h 127.0.0.1 -p 5433 -U "${DB_USER}" -d "${DB_NAME}" \
-  -f migrations/000002_seed_utah_defaults.up.sql
+# 2. Apply schema and seed migrations in order
+#    (000004 adds the 'google_iap' IdP type, 000005 seeds the inactive google-iap IdP row)
+for f in migrations/*.up.sql; do
+  PGPASSWORD="${DB_PASS}" psql \
+    -h 127.0.0.1 -p 5433 -U "${DB_USER}" -d "${DB_NAME}" \
+    -v ON_ERROR_STOP=1 -f "$f" || exit 1
+done
 
 kill "${PROXY_PID}"
 ```
@@ -271,7 +271,28 @@ curl -X POST "${SERVICE_URL}/v1/admin/idps" \
 
 ---
 
-## 9. Production Hardening & Operations Checklist
+## 9. Step 8 (Optional): Google Identity-Aware Proxy (IAP)
+
+If a downstream application is fronted by **Google Cloud Identity-Aware Proxy**, IAP authenticates users at the edge and injects a signed `x-goog-iap-jwt-assertion` JWT header; this service verifies it (Google-published ES256 JWKS, `iss = https://cloud.google.com/iap`) and exchanges it for the app's Zero Trust token. Migrations `000004`/`000005` seed the `google-iap` IdP row **inactive** — activate it with your real audience:
+
+```bash
+PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)")
+
+PGPASSWORD="${DB_PASS}" psql -h 127.0.0.1 -p 5433 -U "${DB_USER}" -d "${DB_NAME}" -c "
+UPDATE identity_providers
+SET client_id = '/projects/${PROJECT_NUMBER}/locations/${REGION}/services/YOUR_SERVICE_NAME',
+    is_active = TRUE
+WHERE slug = 'google-iap';"
+```
+
+Then bind it to the application (`POST /v1/admin/apps/{app_slug}/idps`) and mount the
+`authzclient.IAPTokenExchange` middleware in the downstream Go service. Full walkthrough —
+load balancer setup, multi-service audiences, Identity Platform external users, MFA caveats,
+and testing — in the **[IAP Integration Guide](./IAP_INTEGRATION.md)**.
+
+---
+
+## 10. Production Hardening & Operations Checklist
 
 - [ ] **Bootstrap Key Removed**: Confirm `ADMIN_BOOTSTRAP_API_KEY` is unset after assigning at least two `iam_super_admin` users.
 - [ ] **Cloud Armor / Custom Domain**: Place a Global External Application Load Balancer with **Google Cloud Armor** in front of the Cloud Run service (`authz.water.utah.gov`) with rate-limiting rules on `/v1/auth/token`.

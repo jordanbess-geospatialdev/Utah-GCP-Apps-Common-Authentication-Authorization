@@ -12,9 +12,15 @@ type IdPType string
 const (
 	IdPUtahID              IdPType = "utahid"
 	IdPGCPIdentityPlatform IdPType = "gcp_identity_platform"
+	IdPGoogleIAP           IdPType = "google_iap"
 	IdPEntraID             IdPType = "entra_id"
 	IdPGoogle              IdPType = "google"
 	IdPGenericOIDC         IdPType = "generic_oidc"
+
+	// IAPIssuerURL is the fixed 'iss' claim of Google Cloud Identity-Aware Proxy JWT assertions.
+	IAPIssuerURL = "https://cloud.google.com/iap"
+	// IAPJWKSURI publishes Google IAP's ES256 public keys in standard JWKS format.
+	IAPJWKSURI = "https://www.gstatic.com/iap/verify/public_key-jwk"
 )
 
 // ClaimMappings defines how upstream OIDC claims map to canonical Utah AuthZ user attributes.

@@ -13,6 +13,8 @@ services:
       - ./migrations/000001_init_schema.up.sql:/docker-entrypoint-initdb.d/01_init_schema.sql:ro
       - ./migrations/000002_seed_utah_defaults.up.sql:/docker-entrypoint-initdb.d/02_seed_utah_defaults.sql:ro
       - ./migrations/000003_seed_dwri_personas_and_apps.up.sql:/docker-entrypoint-initdb.d/03_seed_dwri_personas_and_apps.sql:ro
+      - ./migrations/000004_add_google_iap_idp_type.up.sql:/docker-entrypoint-initdb.d/04_add_google_iap_idp_type.sql:ro
+      - ./migrations/000005_seed_google_iap_idp.up.sql:/docker-entrypoint-initdb.d/05_seed_google_iap_idp.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d utah_authz"]
       interval: 5s

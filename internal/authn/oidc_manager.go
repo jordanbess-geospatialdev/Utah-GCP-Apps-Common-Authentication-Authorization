@@ -35,14 +35,23 @@ type UpstreamTokenVerifier interface {
 type MultiIssuerOIDCVerifier struct {
 	store     db.Store
 	mu        sync.RWMutex
-	verifiers map[string]*oidc.IDTokenVerifier // keyed by issuer_url
+	verifiers map[string]issuerVerifier // keyed by issuer_url
+}
+
+// issuerVerifier couples a cached go-oidc verifier with the audiences accepted for that issuer.
+// A single IdP row can list several comma-separated audiences in client_id, which is required
+// for Google IAP where one issuer (https://cloud.google.com/iap) fronts multiple backend
+// services, each asserting its own '/projects/...' audience.
+type issuerVerifier struct {
+	verifier          *oidc.IDTokenVerifier
+	acceptedAudiences []string // >1 entry means go-oidc skips its single-aud check and we enforce membership manually
 }
 
 // NewMultiIssuerOIDCVerifier creates a new multi-issuer OIDC verifier backed by the Store.
 func NewMultiIssuerOIDCVerifier(store db.Store) *MultiIssuerOIDCVerifier {
 	return &MultiIssuerOIDCVerifier{
 		store:     store,
-		verifiers: make(map[string]*oidc.IDTokenVerifier),
+		verifiers: make(map[string]issuerVerifier),
 	}
 }
 
@@ -65,12 +74,12 @@ func (v *MultiIssuerOIDCVerifier) VerifyUpstreamToken(ctx context.Context, rawTo
 		return nil, fmt.Errorf("identity provider %q is disabled: %w", idp.Slug, db.ErrUnauthorized)
 	}
 
-	verifier, err := v.getOrCreateVerifier(ctx, idp)
+	iv, err := v.getOrCreateVerifier(ctx, idp)
 	if err != nil {
 		return nil, fmt.Errorf("initialize oidc verifier for %q: %w", idp.Slug, err)
 	}
 
-	idToken, err := verifier.Verify(ctx, rawToken)
+	idToken, err := iv.verifier.Verify(ctx, rawToken)
 	if err != nil {
 		return nil, fmt.Errorf("verify oidc token signature/claims: %w", err)
 	}
@@ -80,10 +89,16 @@ func (v *MultiIssuerOIDCVerifier) VerifyUpstreamToken(ctx context.Context, rawTo
 		return nil, fmt.Errorf("decode oidc claims: %w", err)
 	}
 
+	if len(iv.acceptedAudiences) > 1 {
+		if err := assertAcceptedAudience(rawClaims, iv.acceptedAudiences); err != nil {
+			return nil, err
+		}
+	}
+
 	return ExtractNormalizedIdentity(idp, idToken.Subject, rawClaims), nil
 }
 
-func (v *MultiIssuerOIDCVerifier) getOrCreateVerifier(ctx context.Context, idp *domain.IdentityProvider) (*oidc.IDTokenVerifier, error) {
+func (v *MultiIssuerOIDCVerifier) getOrCreateVerifier(ctx context.Context, idp *domain.IdentityProvider) (issuerVerifier, error) {
 	v.mu.RLock()
 	cached, ok := v.verifiers[idp.IssuerURL]
 	v.mu.RUnlock()
@@ -97,24 +112,76 @@ func (v *MultiIssuerOIDCVerifier) getOrCreateVerifier(ctx context.Context, idp *
 		return cached, nil
 	}
 
+	acceptedAudiences := splitAcceptedAudiences(idp.ClientID)
+	cfg := &oidc.Config{}
+	switch {
+	case len(acceptedAudiences) == 1:
+		cfg = &oidc.Config{ClientID: acceptedAudiences[0]}
+	case len(acceptedAudiences) > 1:
+		cfg = &oidc.Config{SkipClientIDCheck: true}
+	}
+
 	var verifier *oidc.IDTokenVerifier
 	if idp.JWKSURI != "" {
 		keySet := oidc.NewRemoteKeySet(ctx, idp.JWKSURI)
-		verifier = oidc.NewVerifier(idp.IssuerURL, keySet, &oidc.Config{
-			ClientID: idp.ClientID,
-		})
+		verifier = oidc.NewVerifier(idp.IssuerURL, keySet, cfg)
 	} else {
 		provider, err := oidc.NewProvider(ctx, idp.IssuerURL)
 		if err != nil {
-			return nil, err
+			return issuerVerifier{}, err
 		}
-		verifier = provider.Verifier(&oidc.Config{
-			ClientID: idp.ClientID,
-		})
+		verifier = provider.Verifier(cfg)
 	}
 
-	v.verifiers[idp.IssuerURL] = verifier
-	return verifier, nil
+	entry := issuerVerifier{verifier: verifier, acceptedAudiences: acceptedAudiences}
+	v.verifiers[idp.IssuerURL] = entry
+	return entry, nil
+}
+
+// splitAcceptedAudiences parses a comma-separated client_id into distinct audiences.
+// Single-audience rows keep go-oidc's native audience check; multi-audience rows
+// (e.g., several IAP-protected services under one issuer) are membership-checked after verify.
+func splitAcceptedAudiences(clientID string) []string {
+	parts := strings.Split(clientID, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+// assertAcceptedAudience enforces that at least one token 'aud' value (string or array)
+// matches an accepted audience. Only used when the IdP declares multiple audiences.
+func assertAcceptedAudience(rawClaims map[string]any, accepted []string) error {
+	auds := stringOrSliceClaim(rawClaims["aud"])
+	for _, aud := range auds {
+		for _, want := range accepted {
+			if aud == want {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("token audience %v not in accepted audiences for issuer: %w", auds, db.ErrUnauthorized)
+}
+
+func stringOrSliceClaim(val any) []string {
+	switch v := val.(type) {
+	case string:
+		return []string{v}
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []string:
+		return v
+	}
+	return nil
 }
 
 // ExtractNormalizedIdentity maps raw OIDC claims into a canonical VerifiedIdentity using idp.ClaimMappings.

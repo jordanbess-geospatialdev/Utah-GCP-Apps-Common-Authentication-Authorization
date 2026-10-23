@@ -145,7 +145,7 @@ Returns service health for Cloud Run startup/liveness probes.
 Returns the public ECDSA P-256 JSON Web Key Set (`JWKS`) used to verify tokens issued by `POST /v1/auth/token`.
 
 #### `POST /v1/auth/token` — Token Exchange
-Exchanges an upstream UtahID or External OIDC ID token for a short-lived, audience-scoped JWT.
+Exchanges an upstream UtahID or External OIDC ID token for a short-lived, audience-scoped JWT. The `subject_token` may also be a **Google Identity-Aware Proxy signed-header assertion** (`x-goog-iap-jwt-assertion`) when the active `google-iap` IdP's `client_id` lists the service audience — see the [IAP Integration Guide](./IAP_INTEGRATION.md).
 - **Request**:
   ```json
   {
@@ -284,6 +284,20 @@ func main() {
 	http.ListenAndServe(":8081", mux)
 }
 ```
+
+### Applications Fronted by Google Identity-Aware Proxy (IAP)
+If the downstream service sits behind **Google Cloud Identity-Aware Proxy**, browsers are authenticated at the edge and arrive with the signed `x-goog-iap-jwt-assertion` header instead of a Bearer token. Chain `IAPTokenExchange` **outside** `RequirePermission` — it exchanges the assertion for this app's Zero Trust JWT (cached per user until shortly before expiry) and injects it as the Bearer credential:
+
+```go
+authz := authzclient.NewClient("https://authz.water.utah.gov", "water-resources-map")
+
+protected := authz.IAPTokenExchange(nil)(            // 1. IAP assertion → app-scoped JWT (cached)
+	authz.RequirePermission("basin_layer", "read", nil)( // 2. fine-grained Zero Trust PDP check
+		mux,                                              // 3. your handlers
+	))
+```
+
+Requests without an IAP header pass through untouched (direct Bearer/service-to-service callers keep working); when the header is present it always wins over a client-supplied `Authorization` header. Requires the seeded `google-iap` IdP to be activated with your service's audience — see the **[IAP Integration Guide](./IAP_INTEGRATION.md)**.
 
 ### Python / Node.js / GIS Backend Applications
 Non-Go services integrate using two standard HTTP calls:

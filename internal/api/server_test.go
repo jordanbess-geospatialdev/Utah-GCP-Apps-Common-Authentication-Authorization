@@ -328,6 +328,76 @@ func TestZeroTrustEndToEndFlow(t *testing.T) {
 	}
 }
 
+// TestGoogleIAPAssertionExchange registers a Google Identity-Aware Proxy IdP with
+// multiple comma-separated service audiences and verifies the full exchange flow.
+func TestGoogleIAPAssertionExchange(t *testing.T) {
+	store := db.NewMemoryStore()
+	verifier := &mockUpstreamVerifier{tokens: make(map[string]*authn.VerifiedIdentity)}
+
+	tokenSvc, err := authn.NewTokenService(store, verifier, "https://authz.utah.gov", "test-key-1", "")
+	if err != nil {
+		t.Fatalf("NewTokenService: %v", err)
+	}
+
+	srv := api.NewServer(store, tokenSvc, authz.NewPDP(store), "test-utah-bootstrap-secret")
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Register the IAP IdP: one issuer, two accepted Cloud Run service audiences
+	var iapIDP domain.IdentityProvider
+	doAdminRequest(t, ts.URL, "test-utah-bootstrap-secret", http.MethodPost, "/v1/admin/idps", map[string]any{
+		"slug":           "google-iap",
+		"name":           "Google Cloud Identity-Aware Proxy (IAP)",
+		"provider_type":  "google_iap",
+		"issuer_url":     domain.IAPIssuerURL,
+		"client_id":      "/projects/123456789/locations/us-west3/services/water-map, /projects/123456789/locations/us-west3/services/water-models",
+		"jwks_uri":       domain.IAPJWKSURI,
+		"auto_provision": true,
+		"is_active":      true,
+	}, http.StatusCreated, &iapIDP)
+
+	// 2. Create one app that trusts IAP and one that does not
+	doAdminRequest(t, ts.URL, "test-utah-bootstrap-secret", http.MethodPost, "/v1/admin/apps", map[string]any{
+		"slug": "water-map", "name": "IAP-Protected Water Map", "is_active": true,
+	}, http.StatusCreated, nil)
+	doAdminRequest(t, ts.URL, "test-utah-bootstrap-secret", http.MethodPost, "/v1/admin/apps", map[string]any{
+		"slug": "internal-tool", "name": "Internal Tool (no IAP binding)", "is_active": true,
+	}, http.StatusCreated, nil)
+
+	doAdminRequest(t, ts.URL, "test-utah-bootstrap-secret", http.MethodPost, "/v1/admin/apps/water-map/idps", map[string]any{
+		"idp_slug": "google-iap",
+	}, http.StatusOK, nil)
+
+	// 3. Simulate a Google IAP signed-header assertion verified by the (mocked) OIDC verifier
+	verifier.tokens["iap-assertion-carol"] = &authn.VerifiedIdentity{
+		IdP:           &iapIDP,
+		Subject:       "accounts.google.com:carol@utah.gov",
+		Email:         "carol@utah.gov",
+		EmailVerified: true,
+		DisplayName:   "Carol State Planner",
+		MFAVerified:   false,
+	}
+
+	var carolExchange authn.TokenExchangeResponse
+	doAdminRequest(t, ts.URL, "", http.MethodPost, "/v1/auth/token", map[string]any{
+		"subject_token": "iap-assertion-carol",
+		"target_app":    "water-map",
+	}, http.StatusOK, &carolExchange)
+
+	if carolExchange.User.Email != "carol@utah.gov" {
+		t.Fatalf("expected IAP identity carol@utah.gov, got %s", carolExchange.User.Email)
+	}
+	if len(carolExchange.AccessToken) == 0 {
+		t.Fatal("expected non-empty exchanged access token for IAP assertion")
+	}
+
+	// 4. Exchange against an application that has NOT bound the IAP IdP must be rejected
+	doAdminRequest(t, ts.URL, "", http.MethodPost, "/v1/auth/token", map[string]any{
+		"subject_token": "iap-assertion-carol",
+		"target_app":    "internal-tool",
+	}, http.StatusUnauthorized, nil)
+}
+
 func doAdminRequest(t *testing.T, baseURL, bootstrapKey, method, path string, body any, wantStatus int, out any) {
 	t.Helper()
 	var reqBody *bytes.Reader

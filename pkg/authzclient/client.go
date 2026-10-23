@@ -70,6 +70,44 @@ func (c *Client) Authorize(ctx context.Context, req domain.AuthorizeRequest) (*d
 	return &decision, nil
 }
 
+// ExchangeToken performs RFC 8693 token exchange (POST /v1/auth/token), swapping an upstream
+// OIDC ID token (UtahID, external IdP, or Google IAP assertion) for a short-lived app-scoped JWT.
+func (c *Client) ExchangeToken(ctx context.Context, subjectToken string, organizationID *uuid.UUID) (*authn.TokenExchangeResponse, error) {
+	body := map[string]any{
+		"subject_token": subjectToken,
+		"target_app":    c.appSlug,
+	}
+	if organizationID != nil {
+		body["organization_id"] = organizationID.String()
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/auth/token", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("call authz service: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("token exchange returned status %d", resp.StatusCode)
+	}
+
+	var exchanged authn.TokenExchangeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&exchanged); err != nil {
+		return nil, err
+	}
+	return &exchanged, nil
+}
+
 // RequirePermission returns standard net/http middleware that enforces a fine-grained Zero Trust
 // permission check (resourceType:action) and optional dynamic resourceID extraction before invoking next.
 func (c *Client) RequirePermission(
