@@ -1,10 +1,12 @@
 package api
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -140,6 +142,15 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "principal_id, app_slug, resource_type, and action are required")
 		return
 	}
+	claims, ok := s.requirePDPCaller(w, r, req.AppSlug, req.PrincipalID)
+	if !ok {
+		return
+	}
+	// Identity context comes from the verified token, not the caller-supplied body.
+	req.Context.MFAVerified = claims.MFAVerified
+	if claims.UserType != "" {
+		req.Context.UserType = claims.UserType
+	}
 	if req.Context.ClientIP == "" {
 		req.Context.ClientIP = extractClientIP(r)
 	}
@@ -165,6 +176,15 @@ func (s *Server) handleBatchAuthorize(w http.ResponseWriter, r *http.Request) {
 	if len(req.Checks) > 100 {
 		writeError(w, http.StatusBadRequest, "maximum 100 checks allowed per batch request")
 		return
+	}
+	claims, ok := s.requirePDPCaller(w, r, req.AppSlug, req.PrincipalID)
+	if !ok {
+		return
+	}
+	// Identity context comes from the verified token, not the caller-supplied body.
+	req.Context.MFAVerified = claims.MFAVerified
+	if claims.UserType != "" {
+		req.Context.UserType = claims.UserType
 	}
 	if req.Context.ClientIP == "" {
 		req.Context.ClientIP = extractClientIP(r)
@@ -600,9 +620,11 @@ func (s *Server) handleDeleteAssignment(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) requireAdmin(resourceType, action string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// 1. Allow bootstrap API key if explicitly configured on the server
+		// 1. Allow bootstrap API key if explicitly configured on the server (constant-time
+		// comparison so the secret cannot be recovered via timing side channels).
 		if s.adminBootstrapKey != "" {
-			if providedKey := r.Header.Get("X-Admin-Bootstrap-Key"); providedKey != "" && providedKey == s.adminBootstrapKey {
+			if providedKey := r.Header.Get("X-Admin-Bootstrap-Key"); providedKey != "" &&
+				subtle.ConstantTimeCompare([]byte(providedKey), []byte(s.adminBootstrapKey)) == 1 {
 				next(w, r)
 				return
 			}
@@ -651,6 +673,39 @@ func (s *Server) requireAdmin(resourceType, action string, next http.HandlerFunc
 
 		next(w, r)
 	}
+}
+
+// requirePDPCaller authenticates Policy Decision Point requests. The caller must present a
+// valid app token; a token scoped to the requested application may only evaluate its own
+// subject, while a token scoped to the admin application may evaluate any principal
+// (admin console capability). This prevents the PDP from acting as an unauthenticated
+// decision oracle over arbitrary principals.
+func (s *Server) requirePDPCaller(w http.ResponseWriter, r *http.Request, appSlug string, principalID uuid.UUID) (*authn.AppTokenClaims, bool) {
+	authHeader := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		writeError(w, http.StatusUnauthorized, "PDP requests require a Bearer app token")
+		return nil, false
+	}
+	rawToken := strings.TrimPrefix(authHeader, "Bearer ")
+
+	claims, err := s.tokenSvc.VerifyAppToken(rawToken, "")
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid PDP bearer token: "+err.Error())
+		return nil, false
+	}
+
+	if slices.Contains(claims.Audience, AdminAppSlug) {
+		return claims, true
+	}
+	if !slices.Contains(claims.Audience, appSlug) {
+		writeError(w, http.StatusForbidden, "token audience does not cover requested application")
+		return nil, false
+	}
+	if claims.Subject != principalID.String() {
+		writeError(w, http.StatusForbidden, "principal_id must match the token subject")
+		return nil, false
+	}
+	return claims, true
 }
 
 func (s *Server) withSecurityHeaders(next http.Handler) http.Handler {

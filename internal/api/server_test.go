@@ -3,10 +3,12 @@ package api_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/utah-dnr/utah-gcp-common-authz/internal/api"
@@ -228,9 +230,10 @@ func TestZeroTrustEndToEndFlow(t *testing.T) {
 	}, http.StatusCreated, nil)
 
 	// 9. Verify Fine-Grained Zero Trust Authorization checks via /v1/authorize
+	// (PDP requests must authenticate with the principal's own app token.)
 	// Case A: Bob can write to 'jordan-river-basin'
 	var decision domain.AuthorizeResponse
-	doAdminRequest(t, ts.URL, "", http.MethodPost, "/v1/authorize", domain.AuthorizeRequest{
+	doPDPRequest(t, ts.URL, bobExchange.AccessToken, http.MethodPost, "/v1/authorize", domain.AuthorizeRequest{
 		PrincipalID:  bobExchange.User.ID,
 		AppSlug:      "water-resources-map",
 		ResourceType: "basin_layer",
@@ -241,8 +244,26 @@ func TestZeroTrustEndToEndFlow(t *testing.T) {
 		t.Fatalf("expected Bob to be allowed write on jordan-river-basin, got deny: %s", decision.Reason)
 	}
 
+	// Case A.1: an unauthenticated PDP call is rejected (no decision oracle)
+	doPDPRequest(t, ts.URL, "", http.MethodPost, "/v1/authorize", domain.AuthorizeRequest{
+		PrincipalID:  bobExchange.User.ID,
+		AppSlug:      "water-resources-map",
+		ResourceType: "basin_layer",
+		ResourceID:   "jordan-river-basin",
+		Action:       "write",
+	}, http.StatusUnauthorized, nil)
+
+	// Case A.2: Bob's token cannot evaluate Alice's principal (anti-impersonation)
+	doPDPRequest(t, ts.URL, bobExchange.AccessToken, http.MethodPost, "/v1/authorize", domain.AuthorizeRequest{
+		PrincipalID:  aliceExchange.User.ID,
+		AppSlug:      "water-resources-map",
+		ResourceType: "basin_layer",
+		ResourceID:   "jordan-river-basin",
+		Action:       "write",
+	}, http.StatusForbidden, nil)
+
 	// Case B: Bob is DENIED write on 'bear-river-basin' (Zero Trust resource isolation)
-	doAdminRequest(t, ts.URL, "", http.MethodPost, "/v1/authorize", domain.AuthorizeRequest{
+	doPDPRequest(t, ts.URL, bobExchange.AccessToken, http.MethodPost, "/v1/authorize", domain.AuthorizeRequest{
 		PrincipalID:  bobExchange.User.ID,
 		AppSlug:      "water-resources-map",
 		ResourceType: "basin_layer",
@@ -254,7 +275,7 @@ func TestZeroTrustEndToEndFlow(t *testing.T) {
 	}
 
 	// Case C: Alice can approve watershed models in child org 'utah-dnr-dwre' when on State CIDR + MFA
-	doAdminRequest(t, ts.URL, "", http.MethodPost, "/v1/authorize", domain.AuthorizeRequest{
+	doPDPRequest(t, ts.URL, aliceExchange.AccessToken, http.MethodPost, "/v1/authorize", domain.AuthorizeRequest{
 		PrincipalID:    aliceExchange.User.ID,
 		AppSlug:        "water-resources-map",
 		ResourceType:   "watershed_model",
@@ -271,7 +292,7 @@ func TestZeroTrustEndToEndFlow(t *testing.T) {
 	}
 
 	// Case D: Alice is DENIED watershed_model:approve when connecting from an untrusted IP outside 204.113.0.0/16
-	doAdminRequest(t, ts.URL, "", http.MethodPost, "/v1/authorize", domain.AuthorizeRequest{
+	doPDPRequest(t, ts.URL, aliceExchange.AccessToken, http.MethodPost, "/v1/authorize", domain.AuthorizeRequest{
 		PrincipalID:    aliceExchange.User.ID,
 		AppSlug:        "water-resources-map",
 		ResourceType:   "watershed_model",
@@ -298,7 +319,7 @@ func TestZeroTrustEndToEndFlow(t *testing.T) {
 		"justification":  "Freeze edits during annual audit",
 	}, http.StatusCreated, nil)
 
-	doAdminRequest(t, ts.URL, "", http.MethodPost, "/v1/authorize", domain.AuthorizeRequest{
+	doPDPRequest(t, ts.URL, bobExchange.AccessToken, http.MethodPost, "/v1/authorize", domain.AuthorizeRequest{
 		PrincipalID:  bobExchange.User.ID,
 		AppSlug:      "water-resources-map",
 		ResourceType: "basin_layer",
@@ -325,6 +346,23 @@ func TestZeroTrustEndToEndFlow(t *testing.T) {
 	protectedApp.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected downstream SDK middleware to allow Alice basin_layer:read, got status %d", rec.Code)
+	}
+
+	// 10.1 A forged (unsigned) token claiming to be Alice must be rejected by the SDK's
+	// signature verification, even though its claims are well-formed.
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES256","kid":"test-key-1","typ":"JWT"}`))
+	payload, _ := json.Marshal(map[string]any{
+		"iss": "https://authz.utah.gov", "sub": aliceExchange.User.ID.String(),
+		"aud": "water-resources-map", "exp": time.Now().Add(time.Hour).Unix(),
+		"email": "alice@utah.gov", "user_type": "state_employee", "roles": []string{"senior_hydrologist"},
+	})
+	forged := header + "." + base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString([]byte("not-a-real-signature"))
+	reqForged := httptest.NewRequest(http.MethodGet, "/map?basin=utah-lake", nil)
+	reqForged.Header.Set("Authorization", "Bearer "+forged)
+	recForged := httptest.NewRecorder()
+	protectedApp.ServeHTTP(recForged, reqForged)
+	if recForged.Code != http.StatusUnauthorized {
+		t.Fatalf("expected SDK middleware to reject forged token with 401, got status %d", recForged.Code)
 	}
 }
 
@@ -396,6 +434,48 @@ func TestGoogleIAPAssertionExchange(t *testing.T) {
 		"subject_token": "iap-assertion-carol",
 		"target_app":    "internal-tool",
 	}, http.StatusUnauthorized, nil)
+}
+
+// doPDPRequest performs a Policy Decision Point request authenticated with an app token.
+func doPDPRequest(t *testing.T, baseURL, accessToken, method, path string, body any, wantStatus int, out any) {
+	t.Helper()
+	var reqBody *bytes.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal body: %v", err)
+		}
+		reqBody = bytes.NewReader(b)
+	} else {
+		reqBody = bytes.NewReader(nil)
+	}
+
+	req, err := http.NewRequest(method, baseURL+path, reqBody)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if accessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("http do %s %s: %v", method, path, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != wantStatus {
+		var errBody map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&errBody)
+		t.Fatalf("%s %s: got status %d, want %d (body: %v)", method, path, resp.StatusCode, wantStatus, errBody)
+	}
+
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			t.Fatalf("decode response from %s %s: %v", method, path, err)
+		}
+	}
 }
 
 func doAdminRequest(t *testing.T, baseURL, bootstrapKey, method, path string, body any, wantStatus int, out any) {

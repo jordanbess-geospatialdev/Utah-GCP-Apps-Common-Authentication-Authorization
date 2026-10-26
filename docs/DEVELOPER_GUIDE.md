@@ -286,23 +286,29 @@ func main() {
 ```
 
 ### Applications Fronted by Google Identity-Aware Proxy (IAP)
-If the downstream service sits behind **Google Cloud Identity-Aware Proxy**, browsers are authenticated at the edge and arrive with the signed `x-goog-iap-jwt-assertion` header instead of a Bearer token. Chain `IAPTokenExchange` **outside** `RequirePermission` — it exchanges the assertion for this app's Zero Trust JWT (cached per user until shortly before expiry) and injects it as the Bearer credential:
+If the downstream service sits behind **Google Cloud Identity-Aware Proxy**, browsers are authenticated at the edge and arrive with the signed `x-goog-iap-jwt-assertion` header instead of a Bearer token. Chain `IAPTokenExchange` **outside** `RequirePermission` — it locally verifies the assertion's signature against Google IAP's published public keys, exchanges it for this app's Zero Trust JWT (cached per verified user until shortly before expiry), and injects it as the Bearer credential:
 
 ```go
-authz := authzclient.NewClient("https://authz.water.utah.gov", "water-resources-map")
+authz := authzclient.NewClient("https://authz.water.utah.gov", "water-resources-map",
+	authzclient.WithExpectedIssuer("https://authz.water.utah.gov"), // pin 'iss' in production
+)
 
-protected := authz.IAPTokenExchange(nil)(            // 1. IAP assertion → app-scoped JWT (cached)
+protected := authz.IAPTokenExchange(nil)(            // 1. verify + exchange IAP assertion (cached)
 	authz.RequirePermission("basin_layer", "read", nil)( // 2. fine-grained Zero Trust PDP check
 		mux,                                              // 3. your handlers
 	))
 ```
 
-Requests without an IAP header pass through untouched (direct Bearer/service-to-service callers keep working); when the header is present it always wins over a client-supplied `Authorization` header. Requires the seeded `google-iap` IdP to be activated with your service's audience — see the **[IAP Integration Guide](./IAP_INTEGRATION.md)**.
+Requests without an IAP header pass through untouched (direct Bearer/service-to-service callers keep working); when the header is present it is **signature-verified locally first** (a forged assertion can never be used to look up another user's cached token) and the IAP-verified identity always wins over a client-supplied `Authorization` header. Requires the seeded `google-iap` IdP to be activated with your service's audience — see the **[IAP Integration Guide](./IAP_INTEGRATION.md)**.
+
+### Token verification & PDP security model
+- `RequirePermission` cryptographically verifies every Bearer token (ES256 signature via the authz service's `/.well-known/jwks.json`, `aud == <your app slug>`, and expiry; `iss` too when `WithExpectedIssuer` is set) before any policy call. Unsigned or tampered tokens are rejected with `401`.
+- `POST /v1/authorize` and `/v1/authorize/batch` require the caller's Bearer app token. A token scoped to your app may only evaluate **its own** `sub` as `principal_id`; tokens scoped to `utah-iam-admin` may evaluate any principal (admin console). Identity context (`mfa`, `user_type`) is taken from the verified token, not the request body.
 
 ### Python / Node.js / GIS Backend Applications
 Non-Go services integrate using two standard HTTP calls:
 1. Verify the incoming `Authorization: Bearer <app_jwt>` signature against `GET https://authz.water.utah.gov/.well-known/jwks.json` and check `aud == "<your_app_slug>"`.
-2. Call `POST https://authz.water.utah.gov/v1/authorize` with the token's `sub` (`principal_id`), `resource_type`, `resource_id`, and `action`.
+2. Call `POST https://authz.water.utah.gov/v1/authorize` with the **same Bearer token** in the `Authorization` header, and the token's `sub` (`principal_id`), `resource_type`, `resource_id`, and `action` in the body. The service enforces `principal_id == sub` for app-scoped tokens.
 
 ---
 

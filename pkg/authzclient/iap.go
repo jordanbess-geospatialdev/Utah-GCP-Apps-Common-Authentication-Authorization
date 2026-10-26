@@ -1,14 +1,16 @@
 package authzclient
 
 import (
-	"encoding/base64"
-	"encoding/json"
+	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/utah-dnr/utah-gcp-common-authz/internal/domain"
 )
 
 // IAPAssertionHeader carries the Google Cloud Identity-Aware Proxy signed JWT assertion.
@@ -23,11 +25,18 @@ const iapCacheSkew = 30 * time.Second
 // single-process; entries are keyed by IAP subject+audience, one per active user).
 const iapMaxCacheEntries = 4096
 
+// iapAssertionClaims is the claim set Google IAP embeds in its signed header assertions.
+type iapAssertionClaims struct {
+	jwt.RegisteredClaims
+	Email string `json:"email,omitempty"`
+}
+
 // IAPTokenExchange returns middleware for downstream applications fronted by Google Cloud
 // Identity-Aware Proxy. On every inbound request it reads the signed IAP assertion header,
-// exchanges it for this application's Zero Trust JWT via POST /v1/auth/token, and injects it
-// as the Authorization Bearer credential so downstream middleware (RequirePermission) works
-// unchanged. Exchanged tokens are cached per IAP subject until shortly before expiry.
+// verifies its signature against Google IAP's published public keys, exchanges it for this
+// application's Zero Trust JWT via POST /v1/auth/token, and injects it as the Authorization
+// Bearer credential so downstream middleware (RequirePermission) works unchanged.
+// Exchanged tokens are cached per verified IAP subject+audience until shortly before expiry.
 //
 // Chain it OUTSIDE RequirePermission:
 //
@@ -35,7 +44,9 @@ const iapMaxCacheEntries = 4096
 //
 // When the IAP header is absent the request passes through untouched, so deployments that
 // also accept direct Bearer tokens (e.g., service-to-service calls) keep working; when the
-// header is present the IAP-verified identity always replaces any client-supplied Bearer token.
+// header is present it is locally signature-verified first (so a forged assertion can never
+// be used to look up another user's cached token) and the IAP-verified identity always
+// replaces any client-supplied Bearer token.
 func (c *Client) IAPTokenExchange(organizationID *uuid.UUID) func(http.Handler) http.Handler {
 	cache := &iapTokenCache{entries: make(map[string]iapCacheEntry)}
 	return func(next http.Handler) http.Handler {
@@ -46,7 +57,13 @@ func (c *Client) IAPTokenExchange(organizationID *uuid.UUID) func(http.Handler) 
 				return
 			}
 
-			cacheKey := iapCacheKey(assertion)
+			sub, aud, err := c.verifyIAPAssertion(r.Context(), assertion)
+			if err != nil {
+				http.Error(w, `{"error":"iap assertion failed signature verification"}`, http.StatusUnauthorized)
+				return
+			}
+
+			cacheKey := sub + "|" + aud
 			if token, ok := cache.get(cacheKey); ok {
 				r.Header.Set("Authorization", "Bearer "+token)
 				next.ServeHTTP(w, r)
@@ -66,28 +83,29 @@ func (c *Client) IAPTokenExchange(organizationID *uuid.UUID) func(http.Handler) 
 	}
 }
 
-// iapCacheKey derives a stable cache key from the assertion's subject and audience without
-// verifying it: IAP re-signs the assertion on every request (fresh iat/exp), so the raw token
-// is not a usable key. Cache entries are only created AFTER the authz service has
-// cryptographically verified the assertion, so a forged sub can only cause a cache miss.
-func iapCacheKey(assertion string) string {
-	parts := strings.Split(assertion, ".")
-	if len(parts) != 3 {
-		return assertion
+// verifyIAPAssertion locally verifies an IAP assertion's signature (ES256 or RS256 against
+// Google's published JWKS), its fixed issuer, and its expiry. Audience checking stays with
+// the authz service, which knows which IAP service audiences this application accepts.
+// Only claims from assertions that pass this verification may be used as cache keys: a
+// forged assertion cannot produce another user's cache entry because it cannot carry a
+// valid Google signature over a chosen subject.
+func (c *Client) verifyIAPAssertion(ctx context.Context, assertion string) (sub, aud string, err error) {
+	claims := &iapAssertionClaims{}
+	token, err := jwt.ParseWithClaims(
+		assertion,
+		claims,
+		c.iapKeys.keyFunc(ctx, jwt.SigningMethodES256.Alg(), jwt.SigningMethodRS256.Alg()),
+		jwt.WithValidMethods([]string{jwt.SigningMethodES256.Alg(), jwt.SigningMethodRS256.Alg()}),
+		jwt.WithIssuer(domain.IAPIssuerURL),
+		jwt.WithExpirationRequired(),
+	)
+	if err != nil || !token.Valid {
+		return "", "", fmt.Errorf("verify iap assertion: %w", err)
 	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return assertion
+	if claims.Subject == "" || len(claims.Audience) == 0 {
+		return "", "", fmt.Errorf("iap assertion missing sub/aud claims")
 	}
-	var claims struct {
-		Sub string          `json:"sub"`
-		Aud json.RawMessage `json:"aud"`
-	}
-	if err := json.Unmarshal(payload, &claims); err != nil || claims.Sub == "" {
-		return assertion
-	}
-	aud := strings.Trim(strings.Join(strings.Fields(string(claims.Aud)), ""), `",[]`)
-	return claims.Sub + "|" + aud
+	return claims.Subject, strings.Join(claims.Audience, ","), nil
 }
 
 type iapCacheEntry struct {
@@ -142,22 +160,18 @@ func (c *iapTokenCache) put(key, token string, ttl time.Duration) {
 // assertion for logging or request correlation. It performs NO signature validation;
 // security decisions must go through IAPTokenExchange + RequirePermission.
 func IAPIdentityFromAssertion(assertion string) (sub, aud, email string, ok bool) {
-	parts := strings.Split(assertion, ".")
-	if len(parts) != 3 {
+	decoded, err := decodeAssertionPayload(assertion)
+	if err != nil || decoded.Subject == "" {
 		return "", "", "", false
 	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return "", "", "", false
+	return decoded.Subject, strings.Join(decoded.Audience, ","), decoded.Email, true
+}
+
+// decodeAssertionPayload parses an assertion's payload without any verification.
+func decodeAssertionPayload(assertion string) (*iapAssertionClaims, error) {
+	claims := &iapAssertionClaims{}
+	if _, _, err := jwt.NewParser().ParseUnverified(assertion, claims); err != nil {
+		return nil, err
 	}
-	var claims struct {
-		Sub   string          `json:"sub"`
-		Aud   json.RawMessage `json:"aud"`
-		Email string          `json:"email"`
-	}
-	if err := json.Unmarshal(payload, &claims); err != nil || claims.Sub == "" {
-		return "", "", "", false
-	}
-	aud = strings.Trim(strings.Join(strings.Fields(string(claims.Aud)), ""), `",[]`)
-	return claims.Sub, aud, claims.Email, true
+	return claims, nil
 }

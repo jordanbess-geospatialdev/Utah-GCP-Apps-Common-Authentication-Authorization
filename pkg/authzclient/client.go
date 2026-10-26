@@ -19,26 +19,60 @@ type contextKey string
 
 const principalContextKey contextKey = "utah_zero_trust_principal"
 
+// ClientOption customizes a Zero Trust AuthZ Client.
+type ClientOption func(*Client)
+
+// WithExpectedIssuer pins the expected 'iss' claim of app tokens (the authz service's
+// canonical issuer URL, e.g. https://authz.utah.gov). Strongly recommended in production:
+// without it the client verifies signatures and audiences but not the issuing service.
+func WithExpectedIssuer(issuer string) ClientOption {
+	return func(c *Client) { c.expectedIssuer = issuer }
+}
+
+// WithHTTPClient overrides the HTTP client used for authz service and JWKS calls.
+func WithHTTPClient(hc *http.Client) ClientOption {
+	return func(c *Client) { c.httpClient = hc }
+}
+
+// WithIAPJWKSURL overrides the URL Google IAP public keys are fetched from when verifying
+// inbound IAP assertions (defaults to Google's published key set).
+func WithIAPJWKSURL(url string) ClientOption {
+	return func(c *Client) { c.iapJWKSURL = url }
+}
+
 // Client is a lightweight SDK for downstream Utah Cloud Run applications to enforce Zero Trust permissions.
 type Client struct {
-	baseURL    string
-	appSlug    string
-	httpClient *http.Client
+	baseURL        string
+	appSlug        string
+	httpClient     *http.Client
+	expectedIssuer string
+	iapJWKSURL     string
+	appKeys        *remoteJWKS
+	iapKeys        *remoteJWKS
 }
 
 // NewClient creates a new Zero Trust AuthZ client for a specific downstream application.
-func NewClient(baseURL, appSlug string) *Client {
-	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		appSlug: appSlug,
-		httpClient: &http.Client{
-			Timeout: 5 * time.Second,
-		},
+// App tokens are always signature-verified against the authz service JWKS before use.
+func NewClient(baseURL, appSlug string, opts ...ClientOption) *Client {
+	c := &Client{
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		appSlug:    appSlug,
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+		iapJWKSURL: domain.IAPJWKSURI,
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	c.appKeys = newRemoteJWKS(c.baseURL+"/.well-known/jwks.json", c.httpClient)
+	c.iapKeys = newRemoteJWKS(c.iapJWKSURL, c.httpClient)
+	return c
 }
 
-// Authorize calls the central Policy Decision Point (POST /v1/authorize) to verify a fine-grained action.
-func (c *Client) Authorize(ctx context.Context, req domain.AuthorizeRequest) (*domain.AuthorizeResponse, error) {
+// Authorize calls the central Policy Decision Point (POST /v1/authorize) to verify a
+// fine-grained action. The PDP requires the caller to authenticate with a valid app token
+// whose subject must equal req.PrincipalID (tokens scoped to the admin app may evaluate
+// other principals).
+func (c *Client) Authorize(ctx context.Context, accessToken string, req domain.AuthorizeRequest) (*domain.AuthorizeResponse, error) {
 	if req.AppSlug == "" {
 		req.AppSlug = c.appSlug
 	}
@@ -52,6 +86,9 @@ func (c *Client) Authorize(ctx context.Context, req domain.AuthorizeRequest) (*d
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if accessToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+accessToken)
+	}
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -108,8 +145,31 @@ func (c *Client) ExchangeToken(ctx context.Context, subjectToken string, organiz
 	return &exchanged, nil
 }
 
+// VerifyAppToken validates an exchanged app JWT end-to-end: ES256 signature against the
+// authz service JWKS, 'aud' == this client's app slug, and expiry. When an expected issuer
+// was configured via WithExpectedIssuer, 'iss' is enforced too.
+func (c *Client) VerifyAppToken(ctx context.Context, rawToken string) (*authn.AppTokenClaims, error) {
+	claims := &authn.AppTokenClaims{}
+	parserOpts := []jwt.ParserOption{
+		jwt.WithValidMethods([]string{jwt.SigningMethodES256.Alg()}),
+		jwt.WithAudience(c.appSlug),
+		jwt.WithExpirationRequired(),
+	}
+	if c.expectedIssuer != "" {
+		parserOpts = append(parserOpts, jwt.WithIssuer(c.expectedIssuer))
+	}
+
+	token, err := jwt.ParseWithClaims(rawToken, claims, c.appKeys.keyFunc(ctx, jwt.SigningMethodES256.Alg()), parserOpts...)
+	if err != nil || !token.Valid {
+		return nil, fmt.Errorf("invalid app token: %w", err)
+	}
+	return claims, nil
+}
+
 // RequirePermission returns standard net/http middleware that enforces a fine-grained Zero Trust
 // permission check (resourceType:action) and optional dynamic resourceID extraction before invoking next.
+// The Bearer token is cryptographically verified (JWKS signature, audience, expiry) before any
+// PDP call; unsigned or tampered tokens are rejected without leaving the application.
 func (c *Client) RequirePermission(
 	resourceType string,
 	action string,
@@ -124,11 +184,9 @@ func (c *Client) RequirePermission(
 			}
 			rawToken := strings.TrimPrefix(authHeader, "Bearer ")
 
-			// Parse claims (signature verification can use cached JWKS or PDP check)
-			claims := &authn.AppTokenClaims{}
-			_, _, err := jwt.NewParser().ParseUnverified(rawToken, claims)
+			claims, err := c.VerifyAppToken(r.Context(), rawToken)
 			if err != nil {
-				http.Error(w, `{"error":"malformed bearer token"}`, http.StatusUnauthorized)
+				http.Error(w, `{"error":"invalid or unverified bearer token"}`, http.StatusUnauthorized)
 				return
 			}
 
@@ -143,7 +201,7 @@ func (c *Client) RequirePermission(
 				resourceID = resourceIDExtractor(r)
 			}
 
-			decision, err := c.Authorize(r.Context(), domain.AuthorizeRequest{
+			decision, err := c.Authorize(r.Context(), rawToken, domain.AuthorizeRequest{
 				PrincipalID:    principalID,
 				AppSlug:        c.appSlug,
 				ResourceType:   resourceType,

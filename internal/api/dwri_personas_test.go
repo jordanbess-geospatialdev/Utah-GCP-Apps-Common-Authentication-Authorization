@@ -165,8 +165,8 @@ func TestDWRi2026PersonasAndLegacyMigration(t *testing.T) {
 	_ = store.BindAppIdentityProvider(ctx, domain.AppIdentityProvider{ApplicationID: app.ID, IdPID: extIdP.ID, AllowJITSignup: true, DefaultRoleID: &rWiley.ID})
 	_ = store.BindAppIdentityProvider(ctx, domain.AppIdentityProvider{ApplicationID: app.ID, IdPID: orcidIdP.ID, AllowJITSignup: true, DefaultRoleID: &rSarah.ID})
 
-	// Helper to provision a test persona via Token Exchange
-	loginPersona := func(tokenKey string, idp *domain.IdentityProvider, sub, email, name string, mfa bool) uuid.UUID {
+	// Helper to provision a test persona via Token Exchange (returns user ID + app token)
+	loginPersona := func(tokenKey string, idp *domain.IdentityProvider, sub, email, name string, mfa bool) (uuid.UUID, string) {
 		verifier.tokens[tokenKey] = &authn.VerifiedIdentity{
 			IdP: idp, Subject: sub, Email: email, EmailVerified: true, DisplayName: name, MFAVerified: mfa,
 		}
@@ -175,18 +175,22 @@ func TestDWRi2026PersonasAndLegacyMigration(t *testing.T) {
 			"subject_token": tokenKey,
 			"target_app":    app.Slug,
 		}, http.StatusOK, &ex)
-		return ex.User.ID
+		return ex.User.ID, ex.AccessToken
 	}
 
-	wileyID := loginPersona("tok-wiley", extIdP, "wiley-1", "wiley@ranch.utah", "Wiley Rancher", false)
-	parkerID := loginPersona("tok-parker", extIdP, "parker-1", "parker@prwua.org", "Parker Supplier", false)
-	sarahID := loginPersona("tok-sarah", orcidIdP, "0000-0002-1825-0097", "bart@crau.utah.gov", "Sarah/Bart Researcher", false)
-	codyID := loginPersona("tok-cody", extIdP, "kent-wilkerson", "kent@weberriver.org", "Kent Wilkerson (Commissioner)", false)
-	deputyID := loginPersona("tok-deputy", extIdP, "deputy-weber", "deputy@weberriver.org", "Weber Seasonal Deputy", false)
-	modelerID := loginPersona("tok-modeler", utahIdP, "ed-vidmar", "evidmar@utah.gov", "Ed Vidmar (WCAT Modeler)", true)
-	autoEngID := loginPersona("tok-cole", utahIdP, "cole-panter", "cpanter@utah.gov", "Cole Panter (Automation Eng)", true)
-	diegoID := loginPersona("tok-diego", utahIdP, "adel-abdallah", "aabdallah@utah.gov", "Adel/Diego (Data Steward)", true)
-	waterUseMgrID := loginPersona("tok-wumgr", utahIdP, "wu-mgr", "wumanager@utah.gov", "Water Use Data Manager", true)
+	wileyID, wileyToken := loginPersona("tok-wiley", extIdP, "wiley-1", "wiley@ranch.utah", "Wiley Rancher", false)
+	parkerID, parkerToken := loginPersona("tok-parker", extIdP, "parker-1", "parker@prwua.org", "Parker Supplier", false)
+	sarahID, sarahToken := loginPersona("tok-sarah", orcidIdP, "0000-0002-1825-0097", "bart@crau.utah.gov", "Sarah/Bart Researcher", false)
+	codyID, codyToken := loginPersona("tok-cody", extIdP, "kent-wilkerson", "kent@weberriver.org", "Kent Wilkerson (Commissioner)", false)
+	deputyID, deputyToken := loginPersona("tok-deputy", extIdP, "deputy-weber", "deputy@weberriver.org", "Weber Seasonal Deputy", false)
+	modelerID, modelerToken := loginPersona("tok-modeler", utahIdP, "ed-vidmar", "evidmar@utah.gov", "Ed Vidmar (WCAT Modeler)", true)
+	autoEngID, autoEngToken := loginPersona("tok-cole", utahIdP, "cole-panter", "cpanter@utah.gov", "Cole Panter (Automation Eng)", true)
+	diegoID, diegoToken := loginPersona("tok-diego", utahIdP, "adel-abdallah", "aabdallah@utah.gov", "Adel/Diego (Data Steward)", true)
+	waterUseMgrID, waterUseMgrToken := loginPersona("tok-wumgr", utahIdP, "wu-mgr", "wumanager@utah.gov", "Water Use Data Manager", true)
+
+	// Same Automation Engineer logging in WITHOUT MFA (same user, separate session token):
+	// identity context now comes from the token, so the no-MFA denial path uses this token.
+	_, autoEngNoMFAToken := loginPersona("tok-cole-nomfa", utahIdP, "cole-panter", "cpanter@utah.gov", "Cole Panter (Automation Eng)", false)
 
 	// 5. Assign Scoped Roles to Personas
 	// Parker -> Provo River Water Users Association (PRWUA) only
@@ -236,85 +240,87 @@ func TestDWRi2026PersonasAndLegacyMigration(t *testing.T) {
 		UserID: &waterUseMgrID, Effect: domain.EffectAllow,
 	})
 
-	checkAuth := func(uid uuid.UUID, resType, resID, action string, orgID *uuid.UUID, mfa bool) domain.AuthorizeResponse {
+	// PDP checks authenticate with the persona's own app token; MFA/user_type identity
+	// context is taken from the verified token claims, not the request body.
+	checkAuth := func(token string, uid uuid.UUID, resType, resID, action string, orgID *uuid.UUID) domain.AuthorizeResponse {
 		var resp domain.AuthorizeResponse
-		doAdminRequest(t, ts.URL, "", http.MethodPost, "/v1/authorize", domain.AuthorizeRequest{
+		doPDPRequest(t, ts.URL, token, http.MethodPost, "/v1/authorize", domain.AuthorizeRequest{
 			PrincipalID: uid, AppSlug: app.Slug, ResourceType: resType, ResourceID: resID,
 			Action: action, OrganizationID: orgID,
-			Context: domain.RequestContext{MFAVerified: mfa, ClientIP: "204.113.10.10"},
+			Context: domain.RequestContext{ClientIP: "204.113.10.10"},
 		}, http.StatusOK, &resp)
 		return resp
 	}
 
 	// Assertion 1: Wiley can manage My Sites favorites, but cannot enter measurements or view internal photos
-	if !checkAuth(wileyID, "user_preference", "", "manage_own", nil, false).Allowed {
+	if !checkAuth(wileyToken, wileyID, "user_preference", "", "manage_own", nil).Allowed {
 		t.Fatal("Wiley should be allowed user_preference:manage_own")
 	}
-	if checkAuth(wileyID, "measurement", "weber-river", "create", nil, false).Allowed {
+	if checkAuth(wileyToken, wileyID, "measurement", "weber-river", "create", nil).Allowed {
 		t.Fatal("Wiley must NOT be allowed to enter measurements")
 	}
 
 	// Assertion 2: Parker can submit water use reports and propose boundaries for PRWUA, but NOT for JVWCD
-	if !checkAuth(parkerID, "supplier_report", "", "submit", &prwuaOrg.ID, false).Allowed {
+	if !checkAuth(parkerToken, parkerID, "supplier_report", "", "submit", &prwuaOrg.ID).Allowed {
 		t.Fatal("Parker should be allowed supplier_report:submit for PRWUA")
 	}
-	if checkAuth(parkerID, "supplier_report", "", "submit", &jvwcdOrg.ID, false).Allowed {
+	if checkAuth(parkerToken, parkerID, "supplier_report", "", "submit", &jvwcdOrg.ID).Allowed {
 		t.Fatal("Parker must be DENIED supplier_report:submit for JVWCD")
 	}
 
 	// Assertion 3: Sarah (ORCID Researcher) automatically got sarah_researcher on JIT login; can manage API tokens, cannot see internal gate code photos
-	if !checkAuth(sarahID, "api_token", "", "manage_own", nil, false).Allowed {
+	if !checkAuth(sarahToken, sarahID, "api_token", "", "manage_own", nil).Allowed {
 		t.Fatal("Sarah should be allowed api_token:manage_own")
 	}
-	if checkAuth(sarahID, "attachment_internal", "station-101", "manage", nil, false).Allowed {
+	if checkAuth(sarahToken, sarahID, "attachment_internal", "station-101", "manage", nil).Allowed {
 		t.Fatal("Sarah must be DENIED attachment_internal:manage (internal photos/gate codes)")
 	}
 
 	// Assertion 4: Cody (Kent Wilkerson) can enter/revise readings on 'weber-river', but is DENIED on 'lower-sevier'
-	if !checkAuth(codyID, "measurement", "weber-river", "create", nil, false).Allowed {
+	if !checkAuth(codyToken, codyID, "measurement", "weber-river", "create", nil).Allowed {
 		t.Fatal("Cody should be allowed measurement:create on weber-river")
 	}
-	if checkAuth(codyID, "measurement", "lower-sevier", "create", nil, false).Allowed {
+	if checkAuth(codyToken, codyID, "measurement", "lower-sevier", "create", nil).Allowed {
 		t.Fatal("Cody must be DENIED measurement:create on lower-sevier")
 	}
 
 	// Assertion 5: Expired Deputy Commissioner is automatically DENIED when syncing offline drafts after season end (FR-011, FR-027)
-	if checkAuth(deputyID, "measurement", "weber-river", "create", nil, false).Allowed {
+	if checkAuth(deputyToken, deputyID, "measurement", "weber-river", "create", nil).Allowed {
 		t.Fatal("Expired Deputy Commissioner must be DENIED measurement:create")
 	}
 
 	// Assertion 6: Fatima Modeler can sync WCAT models & view battery voltage diagnostics, but CANNOT withdraw raw readings or edit Pakbus telemetry addresses
-	if !checkAuth(modelerID, "wcat_model", "spanish-fork", "sync", nil, true).Allowed {
+	if !checkAuth(modelerToken, modelerID, "wcat_model", "spanish-fork", "sync", nil).Allowed {
 		t.Fatal("Fatima Modeler should be allowed wcat_model:sync")
 	}
-	if checkAuth(modelerID, "raw_observation", "obs-99", "withdraw", nil, true).Allowed {
+	if checkAuth(modelerToken, modelerID, "raw_observation", "obs-99", "withdraw", nil).Allowed {
 		t.Fatal("Fatima Modeler must be DENIED raw_observation:withdraw")
 	}
-	if checkAuth(modelerID, "telemetry_address", "station-101", "manage", nil, true).Allowed {
+	if checkAuth(modelerToken, modelerID, "telemetry_address", "station-101", "manage", nil).Allowed {
 		t.Fatal("Fatima Modeler must be DENIED telemetry_address:manage")
 	}
 
 	// Assertion 7: Fatima Automation Engineer can withdraw raw readings and edit Pakbus/Cell IP addresses in child Regional Office (Logan) ONLY with MFA
-	if !checkAuth(autoEngID, "raw_observation", "obs-99", "withdraw", &loganRegion.ID, true).Allowed {
+	if !checkAuth(autoEngToken, autoEngID, "raw_observation", "obs-99", "withdraw", &loganRegion.ID).Allowed {
 		t.Fatal("Automation Engineer with MFA should be allowed raw_observation:withdraw in Logan Region")
 	}
-	if checkAuth(autoEngID, "raw_observation", "obs-99", "withdraw", &loganRegion.ID, false).Allowed {
+	if checkAuth(autoEngNoMFAToken, autoEngID, "raw_observation", "obs-99", "withdraw", &loganRegion.ID).Allowed {
 		t.Fatal("Automation Engineer WITHOUT MFA must be DENIED raw_observation:withdraw")
 	}
 
 	// Assertion 8: Diego Water Use Program Data Manager (PDF p. 21) can access Manage Systems review, but CANNOT propose/edit supplier boundaries
-	if !checkAuth(waterUseMgrID, "supplier_system", "", "manage_review", nil, true).Allowed {
+	if !checkAuth(waterUseMgrToken, waterUseMgrID, "supplier_system", "", "manage_review", nil).Allowed {
 		t.Fatal("Water Use Manager should be allowed supplier_system:manage_review")
 	}
-	if checkAuth(waterUseMgrID, "supplier_boundary", "", "propose", nil, true).Allowed {
+	if checkAuth(waterUseMgrToken, waterUseMgrID, "supplier_boundary", "", "propose", nil).Allowed {
 		t.Fatal("Water Use Manager must be DENIED supplier_boundary:propose (per PDF p. 21)")
 	}
 
 	// Assertion 9: Diego Data Steward has sole authority to manage controlled vocabulary & QC rules (with MFA)
-	if !checkAuth(diegoID, "vocabulary", "units", "manage", nil, true).Allowed {
+	if !checkAuth(diegoToken, diegoID, "vocabulary", "units", "manage", nil).Allowed {
 		t.Fatal("Diego Data Steward should be allowed vocabulary:manage")
 	}
-	if checkAuth(autoEngID, "vocabulary", "units", "manage", &loganRegion.ID, true).Allowed {
+	if checkAuth(autoEngToken, autoEngID, "vocabulary", "units", "manage", &loganRegion.ID).Allowed {
 		t.Fatal("Automation Engineer must be DENIED vocabulary:manage (reserved for Diego Data Steward)")
 	}
 }

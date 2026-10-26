@@ -127,13 +127,15 @@ curl -X POST https://authz.water.utah.gov/v1/admin/apps/water-resources-map/idps
 ## 5. Wire the Downstream Go SDK
 
 `pkg/authzclient` ships the `IAPTokenExchange` middleware. It reads the signed header,
-exchanges it for your app's Zero Trust JWT (caching per user until shortly before expiry),
-and injects it as the Bearer credential so `RequirePermission` works unchanged:
+**verifies its signature locally against Google IAP's published public keys** (fetched from
+`https://www.gstatic.com/iap/verify/public_key-jwk`, cached for 5 minutes), exchanges it for
+your app's Zero Trust JWT (caching per verified user until shortly before expiry), and injects
+it as the Bearer credential so `RequirePermission` works unchanged:
 
 ```go
 authz := authzclient.NewClient("https://authz.water.utah.gov", "water-resources-map")
 
-protected := authz.IAPTokenExchange(nil)(          // 1. IAP assertion → app JWT (cached)
+protected := authz.IAPTokenExchange(nil)(          // 1. verify + exchange IAP assertion (cached)
 	authz.RequirePermission("basin_layer", "read", nil)( // 2. fine-grained Zero Trust check
 		mux,                                            // 3. your handlers
 	))
@@ -143,10 +145,13 @@ Behavior notes:
 
 - Requests **without** an IAP header pass through untouched, so direct Bearer callers
   (service-to-service) keep working.
-- When the IAP header **is** present, the IAP-verified identity always replaces any
-  client-supplied `Authorization` header.
-- A failed exchange (invalid/expired assertion, unbound IdP, inactive user) returns `401`
-  before your handler runs.
+- When the IAP header **is** present, the assertion is signature-verified (ES256/RS256,
+  issuer `https://cloud.google.com/iap`, expiry) **before** any cache lookup or exchange,
+  and the IAP-verified identity always replaces any client-supplied `Authorization` header.
+  A forged assertion — even one carrying another user's `sub` — cannot read that user's
+  cached token because it cannot carry a valid Google signature.
+- A failed verification or exchange (bad signature, expired assertion, unbound IdP,
+  inactive user) returns `401` before your handler runs.
 - For non-Go backends, pass the raw `x-goog-iap-jwt-assertion` value as `subject_token` to
   `POST /v1/auth/token` yourself — the REST contract is identical.
 
